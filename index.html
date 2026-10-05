@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>小朋友集點卡</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<style>
+  :root { box-sizing: border-box; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); --bg:#fff7ed; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#1c1917; } }
+  :root[data-theme="dark"] { --bg:#1c1917; }
+  body { background: var(--bg); font-family: "PingFang TC","Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; }
+  @keyframes pop { 0%{transform:scale(0)} 70%{transform:scale(1.3)} 100%{transform:scale(1)} }
+  .pop { animation: pop .35s ease-out; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+const PER = 10;
+const COLORS = ["#f97316","#ec4899","#8b5cf6","#0ea5e9","#10b981","#eab308"];
+const EMOJIS = ["🐶","🐱","🐰","🐼","🦁","🐸","🦄","🐯"];
+const KEY = "stamp-card-v2";
+const uid = () => Math.random().toString(36).slice(2, 9);
+const INIT = { kids: [], log: [], pin: "", rewards: [
+  { id: "r1", emoji: "📺", name: "看卡通 30 分鐘", cost: 10 },
+  { id: "r2", emoji: "🍦", name: "冰淇淋一支", cost: 20 },
+  { id: "r3", emoji: "🧸", name: "小玩具一個", cost: 50 } ] };
+async function sha(s) {
+  try { const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("sc:" + s));
+    return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join(""); }
+  catch (e) { return "p:" + btoa(s); }
+}
+const fmt = t => new Date(t).toLocaleString("zh-TW", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+const bal = k => k.points - (k.spent || 0);
+const toPhoto = file => new Promise((res, rej) => {
+  const r = new FileReader();
+  r.onload = () => { const im = new Image();
+    im.onload = () => { const S = 160, c = document.createElement("canvas"); c.width = c.height = S; const m = Math.min(im.width, im.height);
+      c.getContext("2d").drawImage(im, (im.width - m) / 2, (im.height - m) / 2, m, m, 0, 0, S, S); res(c.toDataURL("image/jpeg", 0.8)); };
+    im.onerror = rej; im.src = r.result; };
+  r.onerror = rej; r.readAsDataURL(file);
+});
+function Avatar({ kid, size, onFile, t = "text-3xl" }) {
+  const body = kid.photo ? <img src={kid.photo} alt="" className="w-full h-full object-cover" /> : <span className={t}>{kid.emoji}</span>;
+  const cls = size + " rounded-full overflow-hidden flex items-center justify-center relative shrink-0";
+  return onFile
+    ? <label className={cls + " cursor-pointer"} style={{ background: kid.color + "33" }} title="更換照片">{body}
+        <span className="absolute bottom-0 inset-x-0 bg-black/40 text-white text-[10px] text-center">📷</span>
+        <input type="file" accept="image/*" className="hidden" onChange={e => { onFile(e.target.files[0]); e.target.value = ""; }} /></label>
+    : <div className={cls} style={{ background: kid.color + "33" }}>{body}</div>;
+}
+const btn = "rounded-2xl font-bold active:scale-95 transition ";
+
+function Modal({ title, onClose, children }) {
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 flex items-end sm:items-center justify-center p-3" onClick={onClose}>
+      <div className="w-full max-w-md rounded-3xl bg-white dark:bg-stone-800 text-stone-800 dark:text-stone-100 p-5 max-h-[85vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+        <div className="flex justify-between items-center mb-3"><h3 className="text-lg font-bold">{title}</h3>
+          <button onClick={onClose} className="text-2xl text-stone-400">×</button></div>
+        {children}
+      </div>
+    </div>);
+}
+const inp = "w-full h-12 px-4 rounded-2xl border-2 border-stone-200 dark:border-stone-600 bg-transparent outline-none focus:border-orange-400";
+
+function PinModal({ pin, onOk, onClose }) {
+  const [v, setV] = useState(""); const [err, setErr] = useState(false);
+  const check = async () => { if (await sha(v) === pin) onOk(); else { setErr(true); setV(""); } };
+  return (
+    <Modal title="🔒 請輸入家長 PIN" onClose={onClose}>
+      <input type="password" inputMode="numeric" maxLength={6} autoFocus value={v} onChange={e => { setV(e.target.value.replace(/\D/g, "")); setErr(false); }}
+        onKeyDown={e => e.key === "Enter" && check()} className={inp + " text-center text-2xl tracking-widest"} />
+      {err && <p className="text-red-500 text-sm mt-2">PIN 不正確</p>}
+      <button onClick={check} className={btn + "w-full h-12 mt-3 bg-orange-500 text-white"}>解鎖</button>
+    </Modal>);
+}
+
+function PointModal({ kid, onSave, onClose }) {
+  const [d, setD] = useState(1); const [note, setNote] = useState("");
+  return (
+    <Modal title={kid.emoji + " " + kid.name + "：加／扣點"} onClose={onClose}>
+      <div className="flex items-center gap-3 justify-center mb-3">
+        <button onClick={() => setD(d - 1)} className={btn + "w-12 h-12 bg-stone-100 dark:bg-stone-700 text-xl"}>−</button>
+        <input type="number" value={d} onChange={e => setD(parseInt(e.target.value) || 0)} className={inp + " w-24 text-center text-2xl"} />
+        <button onClick={() => setD(d + 1)} className={btn + "w-12 h-12 bg-stone-100 dark:bg-stone-700 text-xl"}>＋</button>
+      </div>
+      <div className="flex gap-2 justify-center mb-3">{[1, 2, 5, 10, -1].map(n => (
+        <button key={n} onClick={() => setD(n)} className={btn + "px-3 h-9 text-sm bg-orange-100 text-orange-700"}>{n > 0 ? "+" : ""}{n}</button>))}</div>
+      <input value={note} onChange={e => setNote(e.target.value)} placeholder="備註（例如：自己收玩具）" className={inp} />
+      <button disabled={!d} onClick={() => onSave(d, note)} className={btn + "w-full h-12 mt-3 bg-orange-500 text-white disabled:opacity-40"}>確認</button>
+    </Modal>);
+}
+
+function RedeemModal({ kid, rewards, onRedeem, onClose }) {
+  return (
+    <Modal title={"🎁 " + kid.name + " 兌換（可用 " + bal(kid) + " 點）"} onClose={onClose}>
+      {rewards.length === 0 && <p className="text-stone-400">尚未設定獎勵，請到「獎勵」頁新增。</p>}
+      <div className="space-y-2">{rewards.map(r => { const ok = bal(kid) >= r.cost; return (
+        <button key={r.id} disabled={!ok} onClick={() => onRedeem(r)}
+          className={btn + "w-full flex items-center gap-3 p-3 text-left border-2 " + (ok ? "border-orange-300 bg-orange-50 dark:bg-stone-700" : "border-stone-200 dark:border-stone-700 opacity-40")}>
+          <span className="text-2xl">{r.emoji}</span><span className="flex-1">{r.name}</span><b>{r.cost} 點</b></button>); })}</div>
+    </Modal>);
+}
+
+function KidCard({ kid, onPhoto, onAdd, onCustom, onRedeem, onDelete }) {
+  const [c, setC] = useState(false);
+  const done = Math.floor(kid.points / PER), f = kid.points % PER;
+  return (
+    <div className="rounded-3xl bg-white dark:bg-stone-800 shadow-md p-4 border-t-8" style={{ borderColor: kid.color }}>
+      <div className="flex items-center gap-3 mb-3">
+        <Avatar kid={kid} size="w-14 h-14" onFile={onPhoto} />
+        <div className="flex-1 min-w-0">
+          <div className="text-lg font-bold truncate text-stone-800 dark:text-stone-100">{kid.name}</div>
+          <div className="text-sm text-stone-500 dark:text-stone-400">可用 <b className="text-lg" style={{ color: kid.color }}>{bal(kid)}</b>・累積 {kid.points}</div>
+        </div>
+        <div className="text-center"><div className="text-2xl">🏆</div><div className="text-xs font-bold text-stone-600 dark:text-stone-300">滿卡 ×{done}</div></div>
+      </div>
+      <div className="grid grid-cols-5 gap-2">{Array.from({ length: PER }).map((_, i) => i < f
+        ? <div key={i + "on"} className="pop aspect-square rounded-full flex items-center justify-center text-xl shadow" style={{ background: kid.color }}>⭐</div>
+        : <div key={i} className="aspect-square rounded-full flex items-center justify-center text-sm border-2 border-dashed border-stone-300 dark:border-stone-600 text-stone-300 dark:text-stone-600">{i + 1}</div>)}</div>
+      <div className="flex gap-2 mt-4">
+        <button onClick={onAdd} className={btn + "flex-1 h-12 text-white text-lg shadow"} style={{ background: kid.color }}>＋1 點</button>
+        <button onClick={onCustom} className={btn + "px-4 h-12 bg-stone-100 dark:bg-stone-700 text-stone-700 dark:text-stone-200"}>備註／自訂</button>
+        <button onClick={onRedeem} className={btn + "w-12 h-12 bg-amber-100 text-xl"}>🎁</button>
+      </div>
+      <div className="mt-3 text-right text-xs">
+        {c ? <span><span className="text-red-500 mr-2">確定刪除？</span><button onClick={onDelete} className="text-red-500 font-bold mr-3">刪除</button><button onClick={() => setC(false)} className="text-stone-500">取消</button></span>
+          : <button onClick={() => setC(true)} className="text-stone-400 hover:text-red-500">刪除小朋友</button>}
+      </div>
+    </div>);
+}
+
+function App() {
+  const [data, setData] = useState(() => { try { const r = localStorage.getItem(KEY); if (r) return JSON.parse(r); } catch (e) {} return INIT; });
+  const [tab, setTab] = useState("kids");
+  const [sync, setSync] = useState("local");
+  const [unlocked, setUnlocked] = useState(false);
+  const [modal, setModal] = useState(null);
+  const [pinAsk, setPinAsk] = useState(null);
+  const [name, setName] = useState(""), [emoji, setEmoji] = useState(EMOJIS[0]), [photo, setPhoto] = useState("");
+  const [logKid, setLogKid] = useState("all");
+  const ref = useRef(null), dataRef = useRef(data);
+  dataRef.current = data;
+
+  useEffect(() => {
+    let un = () => {};
+    (async () => {
+      try {
+        const db = window.claude && await window.claude.use("db"); if (!db) return;
+        ref.current = db.doc("cards/state");
+        un = ref.current.onSnapshot(s => {
+          if (s.exists) { const d = s.data(); setData(d); try { localStorage.setItem(KEY, JSON.stringify(d)); } catch (e) {} setSync("cloud"); }
+          else ref.current.set(dataRef.current).then(() => setSync("cloud")).catch(() => setSync("ro"));
+        }, () => setSync("local"));
+      } catch (e) {}
+    })();
+    return () => un();
+  }, []);
+
+  const commit = fn => {
+    const nd = fn(dataRef.current); dataRef.current = nd; setData(nd);
+    try { localStorage.setItem(KEY, JSON.stringify(nd)); } catch (e) {}
+    if (ref.current) ref.current.set(nd).catch(() => setSync("ro"));
+  };
+  const guard = fn => { if (!data.pin || unlocked) fn(); else setPinAsk(() => fn); };
+  const addLog = (d, k, note, type) => ({ id: uid(), kid: k.id, kn: k.name, d, note, type, t: Date.now() });
+  const addPts = (k, d, note) => commit(s => ({ ...s,
+    kids: s.kids.map(x => x.id === k.id ? { ...x, points: Math.max(0, x.points + d) } : x),
+    log: [addLog(d, k, note, "add"), ...s.log].slice(0, 500) }));
+  const redeem = (k, r) => commit(s => ({ ...s,
+    kids: s.kids.map(x => x.id === k.id ? { ...x, spent: (x.spent || 0) + r.cost } : x),
+    log: [addLog(-r.cost, k, r.emoji + " " + r.name, "redeem"), ...s.log].slice(0, 500) }));
+  const addKid = () => { const n = name.trim(); if (!n) return;
+    commit(s => ({ ...s, kids: [...s.kids, { id: uid(), name: n, emoji, color: COLORS[s.kids.length % COLORS.length], points: 0, spent: 0, photo }] }));
+    setName(""); setPhoto(""); setEmoji(EMOJIS[(data.kids.length + 1) % EMOJIS.length]); };
+
+  const syncLabel = { cloud: "☁️ 已同步", local: "📴 僅存本機", ro: "👀 唯讀（無寫入權限）" }[sync];
+  const tabs = [["kids", "👧 小朋友"], ["rewards", "🎁 獎勵"], ["log", "📜 紀錄"], ["set", "⚙️ 設定"]];
+
+  return (
+    <div className="max-w-5xl mx-auto p-4 sm:p-6 text-stone-800 dark:text-stone-100">
+      <div className="flex items-center justify-between mb-1">
+        <h1 className="text-2xl sm:text-3xl font-extrabold text-orange-500">⭐ 小朋友集點卡</h1>
+        <button onClick={() => data.pin && (unlocked ? setUnlocked(false) : setPinAsk(() => () => {}))}
+          className={btn + "px-3 h-10 text-sm bg-white dark:bg-stone-800 shadow"}>{!data.pin ? "🔓 未設PIN" : unlocked ? "🔓 家長模式" : "🔒 已鎖定"}</button>
+      </div>
+      <p className="text-xs text-stone-500 dark:text-stone-400 mb-4">{syncLabel}・每 {PER} 點集滿一張卡，點數可無限累積</p>
+      <div className="flex gap-2 mb-5 overflow-x-auto">{tabs.map(([k, l]) => (
+        <button key={k} onClick={() => setTab(k)} className={btn + "px-4 h-10 whitespace-nowrap " + (tab === k ? "bg-orange-500 text-white" : "bg-white dark:bg-stone-800")}>{l}</button>))}</div>
+
+      {tab === "kids" && <>
+        <div className="rounded-3xl bg-white dark:bg-stone-800 shadow p-4 mb-5">
+          <div className="flex flex-wrap gap-2 mb-3">{EMOJIS.map(e => (
+            <button key={e} onClick={() => setEmoji(e)} className={"w-11 h-11 rounded-full text-2xl " + (emoji === e ? "bg-orange-200 ring-2 ring-orange-400" : "bg-stone-100 dark:bg-stone-700")}>{e}</button>))}</div>
+          <div className="flex items-center gap-3 mb-3">
+            <Avatar kid={{ photo, emoji, color: "#f97316" }} size="w-14 h-14" />
+            <label className={btn + "px-4 h-11 bg-sky-500 text-white flex items-center cursor-pointer"}>📷 上傳照片
+              <input type="file" accept="image/*" className="hidden" onChange={async e => { const f = e.target.files[0]; e.target.value = ""; if (f) try { setPhoto(await toPhoto(f)); } catch (x) {} }} /></label>
+            {photo && <button onClick={() => setPhoto("")} className="text-sm text-stone-500">移除照片</button>}
+          </div>
+          <div className="flex gap-2">
+            <input value={name} onChange={e => setName(e.target.value)} onKeyDown={e => e.key === "Enter" && guard(addKid)} placeholder="輸入小朋友的名字" maxLength={12} className={inp} />
+            <button onClick={() => guard(addKid)} className={btn + "px-5 h-12 bg-orange-500 text-white"}>新增</button></div>
+        </div>
+        {data.kids.length === 0 ? <div className="text-center py-16 text-stone-400"><div className="text-6xl mb-3">🎈</div>先新增一位小朋友吧！</div> :
+          <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">{data.kids.map(k => (
+            <KidCard key={k.id} kid={k}
+              onPhoto={async f => { if (!f) return; try { const ph = await toPhoto(f); guard(() => commit(s => ({ ...s, kids: s.kids.map(x => x.id === k.id ? { ...x, photo: ph } : x) }))); } catch (x) {} }}
+              onAdd={() => guard(() => addPts(k, 1, ""))}
+              onCustom={() => guard(() => setModal({ t: "pt", k }))}
+              onRedeem={() => guard(() => setModal({ t: "rd", k }))}
+              onDelete={() => guard(() => commit(s => ({ ...s, kids: s.kids.filter(x => x.id !== k.id) })))} />))}</div>}
+      </>}
+
+      {tab === "rewards" && <RewardsTab data={data} guard={guard} commit={commit} />}
+
+      {tab === "log" && <div>
+        <div className="flex gap-3 overflow-x-auto pb-2 mb-3">
+          <button onClick={() => setLogKid("all")} className={"shrink-0 flex flex-col items-center gap-1 px-3 py-2 rounded-2xl " + (logKid === "all" ? "bg-orange-500 text-white" : "bg-white dark:bg-stone-800")}>
+            <span className="w-12 h-12 rounded-full bg-orange-100 flex items-center justify-center text-2xl">👨‍👩‍👧</span><span className="text-xs font-bold">全部小朋友</span></button>
+          {data.kids.map(k => (
+            <button key={k.id} onClick={() => setLogKid(k.id)} className={"shrink-0 flex flex-col items-center gap-1 px-3 py-2 rounded-2xl " + (logKid === k.id ? "text-white" : "bg-white dark:bg-stone-800")} style={logKid === k.id ? { background: k.color } : {}}>
+              <Avatar kid={k} size="w-12 h-12" t="text-2xl" /><span className="text-xs font-bold max-w-[4.5rem] truncate">{k.name}</span></button>))}
+        </div>
+        <div className="space-y-2">{data.log.filter(l => logKid === "all" || l.kid === logKid).map(l => (
+          <LogRow key={l.id} l={l} kid={data.kids.find(k => k.id === l.kid)} onDelete={() => guard(() => commit(s => ({ ...s, log: s.log.filter(x => x.id !== l.id) })))} />))}
+          {data.log.length === 0 && <p className="text-center text-stone-400 py-10">還沒有紀錄</p>}</div>
+      </div>}
+
+      {tab === "set" && <SettingsTab data={data} guard={guard} commit={commit} sync={sync} setUnlocked={setUnlocked} />}
+
+      {modal && modal.t === "pt" && <PointModal kid={modal.k} onClose={() => setModal(null)} onSave={(d, n) => { addPts(modal.k, d, n); setModal(null); }} />}
+      {modal && modal.t === "rd" && <RedeemModal kid={data.kids.find(k => k.id === modal.k.id) || modal.k} rewards={data.rewards} onClose={() => setModal(null)} onRedeem={r => { redeem(modal.k, r); setModal(null); }} />}
+      {pinAsk && <PinModal pin={data.pin} onClose={() => setPinAsk(null)} onOk={() => { setUnlocked(true); const f = pinAsk; setPinAsk(null); f(); }} />}
+    </div>);
+}
+
+function LogRow({ l, kid, onDelete }) {
+  const [c, setC] = useState(false);
+  return (
+    <div className="flex items-center gap-3 rounded-2xl bg-white dark:bg-stone-800 p-3 shadow-sm">
+      <div className={"w-12 text-center font-extrabold " + (l.d > 0 ? "text-emerald-500" : "text-rose-500")}>{l.d > 0 ? "+" : ""}{l.d}</div>
+      <Avatar kid={kid || { emoji: "👤", color: "#a8a29e" }} size="w-10 h-10" t="text-xl" />
+      <div className="flex-1 min-w-0"><div className="font-semibold truncate">{l.kn}{l.type === "redeem" && <span className="ml-2 text-xs text-amber-600">兌換</span>}</div>
+        <div className="text-xs text-stone-500 dark:text-stone-400 truncate">{l.note || "（無備註）"}</div></div>
+      <div className="text-xs text-stone-400">{fmt(l.t)}</div>
+      {c ? <div className="flex gap-2 text-sm shrink-0"><button onClick={onDelete} className="text-red-500 font-bold">刪除</button><button onClick={() => setC(false)} className="text-stone-500">取消</button></div>
+        : <button onClick={() => setC(true)} aria-label="刪除紀錄" className="shrink-0 w-8 h-8 rounded-full text-stone-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-stone-700">🗑️</button>}
+    </div>);
+}
+function RewardsTab({ data, guard, commit }) {
+  const [n, setN] = useState(""), [c, setC] = useState(10), [e, setE] = useState("🎁");
+  const add = () => { if (!n.trim()) return; commit(s => ({ ...s, rewards: [...s.rewards, { id: uid(), name: n.trim(), cost: c, emoji: e }] })); setN(""); };
+  return (
+    <div>
+      <div className="rounded-3xl bg-white dark:bg-stone-800 shadow p-4 mb-4 grid grid-cols-[3rem_1fr_5rem] gap-2">
+        <input value={e} onChange={x => setE(x.target.value)} className={inp + " px-1 text-center"} />
+        <input value={n} onChange={x => setN(x.target.value)} placeholder="獎勵名稱" className={inp} />
+        <input type="number" min="1" value={c} onChange={x => setC(Math.max(1, parseInt(x.target.value) || 1))} className={inp + " px-2 text-center"} />
+        <button onClick={() => guard(add)} className={btn + "col-span-3 h-11 bg-orange-500 text-white"}>新增獎勵（所需點數）</button>
+      </div>
+      <div className="space-y-2">{data.rewards.map(r => (
+        <div key={r.id} className="flex items-center gap-3 rounded-2xl bg-white dark:bg-stone-800 p-3 shadow-sm">
+          <span className="text-2xl">{r.emoji}</span><span className="flex-1">{r.name}</span><b className="text-orange-500">{r.cost} 點</b>
+          <button onClick={() => guard(() => commit(s => ({ ...s, rewards: s.rewards.filter(x => x.id !== r.id) })))} className="text-stone-400 hover:text-red-500">✕</button></div>))}</div>
+      <p className="text-xs text-stone-400 mt-3">兌換請在小朋友卡片按 🎁。</p>
+    </div>);
+}
+
+function SettingsTab({ data, guard, commit, sync, setUnlocked }) {
+  const [pin, setPin] = useState(""), [txt, setTxt] = useState(""), [msg, setMsg] = useState(""), [ok, setOk] = useState(false);
+  const exportStr = () => JSON.stringify({ app: "stamp-card", ver: 2, at: new Date().toISOString(), data }, null, 2);
+  const save = async () => {
+    try { const dl = window.claude && await window.claude.use("downloads");
+      if (dl) { await dl.save({ filename: "stamp-card-backup-" + new Date().toISOString().slice(0, 10) + ".json", data: exportStr() }); setMsg("已匯出"); }
+      else { setTxt(exportStr()); setMsg("請複製下方文字保存"); }
+    } catch (e) { setTxt(exportStr()); setMsg("無法直接下載，請複製下方文字"); }
+  };
+  const doImport = () => { try { const j = JSON.parse(txt); const d = j.data || j;
+      if (!Array.isArray(d.kids)) throw 0;
+      commit(() => ({ ...INIT, ...d })); setMsg("匯入完成"); setOk(false); setTxt(""); } catch (e) { setMsg("格式不正確，無法匯入"); } };
+  const file = f => { if (!f) return; const r = new FileReader(); r.onload = () => setTxt(String(r.result)); r.readAsText(f); };
+  const card = "rounded-3xl bg-white dark:bg-stone-800 shadow p-4 mb-4 ";
+  return (
+    <div>
+      <div className={card}><h3 className="font-bold mb-2">☁️ 多裝置同步</h3>
+        <p className="text-sm text-stone-500 dark:text-stone-400">{sync === "cloud" ? "已連線，所有登入同一組織／被授權的裝置會即時同步。" : sync === "ro" ? "目前帳號沒有寫入權限，僅能檢視。" : "目前無雲端連線，資料只存在這台裝置，可用下方備份轉移。"}</p></div>
+      <div className={card}><h3 className="font-bold mb-2">🔒 家長 PIN 碼</h3>
+        <div className="flex gap-2"><input type="password" inputMode="numeric" maxLength={6} value={pin} onChange={e => setPin(e.target.value.replace(/\D/g, ""))} placeholder="4–6 位數字" className={inp} />
+          <button disabled={pin.length < 4} onClick={() => guard(async () => { const h = await sha(pin); commit(s => ({ ...s, pin: h })); setPin(""); setUnlocked(false); setMsg("PIN 已設定，已鎖定"); })} className={btn + "px-4 h-12 bg-orange-500 text-white disabled:opacity-40"}>設定</button></div>
+        {data.pin && <button onClick={() => guard(() => { commit(s => ({ ...s, pin: "" })); setMsg("PIN 已移除"); })} className="text-sm text-red-500 mt-2">移除 PIN</button>}
+        <p className="text-xs text-stone-400 mt-2">PIN 用於擋住小朋友誤觸，並非嚴格的安全機制。</p></div>
+      <div className={card}><h3 className="font-bold mb-2">💾 匯出／匯入備份</h3>
+        <div className="flex gap-2 mb-2"><button onClick={save} className={btn + "flex-1 h-11 bg-emerald-500 text-white"}>匯出備份</button>
+          <label className={btn + "flex-1 h-11 bg-sky-500 text-white flex items-center justify-center cursor-pointer"}>選擇檔案<input type="file" accept=".json,application/json" className="hidden" onChange={e => file(e.target.files[0])} /></label></div>
+        <textarea value={txt} onChange={e => setTxt(e.target.value)} rows={5} placeholder="匯出的內容會顯示在這；或貼上備份 JSON 後匯入" className={inp + " h-auto py-2 text-xs font-mono"} />
+        {txt && (ok ? <div className="mt-2 text-sm"><span className="text-red-500 mr-2">將覆蓋目前全部資料，確定？</span>
+          <button onClick={() => guard(doImport)} className="font-bold text-red-500 mr-3">確定匯入</button><button onClick={() => setOk(false)}>取消</button></div>
+          : <button onClick={() => setOk(true)} className={btn + "w-full h-11 mt-2 bg-stone-200 dark:bg-stone-700"}>匯入這份資料</button>)}</div>
+      {msg && <p className="text-center text-sm text-orange-500">{msg}</p>}
+    </div>);
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
