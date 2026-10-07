@@ -35,6 +35,88 @@ async function sha(s) {
     return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join(""); }
   catch (e) { return "p:" + btoa(s); }
 }
+/* ===== 雲端同步（Firebase Realtime Database，REST + SSE，免安裝 SDK）=====
+   整份資料存成 { u: 最後修改時間, by: 裝置ID, json: 字串 }，以 u 較新者為準（最後改的那台贏）。 */
+const CFG_KEY = "stamp-card-sync";
+const DEV = (() => { try { let d = localStorage.getItem("stamp-card-dev"); if (!d) { d = uid() + uid(); localStorage.setItem("stamp-card-dev", d); } return d; } catch (e) { return uid() + uid(); } })();
+const loadCfg = () => { try { const c = JSON.parse(localStorage.getItem(CFG_KEY)); return c && c.url && c.code ? c : null; } catch (e) { return null; } };
+const nodeUrl = c => c.url + "/stamp/" + encodeURIComponent(c.code) + ".json";
+const hasContent = d => !!d && ((d.kids && d.kids.length) || (d.log && d.log.length));
+const newCode = () => { const a = new Uint8Array(20); crypto.getRandomValues(a); return [...a].map(x => "abcdefghijkmnpqrstuvwxyz23456789"[x % 32]).join(""); };
+const CODE_RE = /^[A-Za-z0-9_-]{12,64}$/;
+(function () { // 開啟「手機設定連結」時自動套用設定
+  try { const m = location.hash.match(/#sync=([^&]+)/); if (!m) return;
+    const o = JSON.parse(atob(decodeURIComponent(m[1])));
+    history.replaceState(null, "", location.pathname + location.search);
+    if (/^https:\/\//.test(o.u) && CODE_RE.test(o.c)) localStorage.setItem(CFG_KEY, JSON.stringify({ url: o.u, code: o.c }));
+  } catch (e) {}
+})();
+
+function startSync(cfg, api) {
+  let es = null, pt = null, rt = null, dead = false, backoff = 1000, sentU = 0;
+  const url = nodeUrl(cfg);
+
+  const send = async keep => {
+    pt = null; if (dead) return;
+    const d = api.get(); if (!d.u || d.u <= sentU) return;
+    const prev = sentU, u = d.u;
+    const body = JSON.stringify({ u, by: DEV, json: JSON.stringify(d) });
+    sentU = u;
+    try {
+      const r = await fetch(url, { method: "PUT", body, keepalive: !!keep && body.length < 60000 });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      api.status("cloud");
+    } catch (e) {
+      if (sentU === u) sentU = prev;
+      api.status("err"); if (!dead) push(5000);
+    }
+  };
+  const push = (delay = 300) => { clearTimeout(pt); pt = setTimeout(send, delay); };
+
+  const onNode = node => {
+    const l = api.get();
+    if (!node || typeof node.json !== "string") {            // 雲端還是空的：把本機資料放上去
+      if (hasContent(l)) { if (!l.u) api.apply({ ...l, u: Date.now() }); push(0); }
+      return;
+    }
+    const ru = +node.u || 0, lu = l.u || 0;
+    if (ru > lu) {                                            // 雲端比較新：套用
+      try { const d = JSON.parse(node.json); if (Array.isArray(d.kids)) api.apply({ ...INIT, ...d, u: ru }); } catch (e) {}
+    } else if (ru < lu && lu > sentU) push(0);                // 本機比較新且還沒送出：上傳
+  };
+
+  const open = () => {
+    if (dead) return;
+    clearTimeout(rt); if (es) es.close();
+    api.status("wait");
+    es = new EventSource(url);
+    let remote = null;
+    const ev = (e, merge) => {
+      let m; try { m = JSON.parse(e.data); } catch (x) { return; } if (!m) return;
+      const p = m.path || "/";
+      if (p !== "/") { fetch(url).then(r => r.json()).then(onNode).catch(() => {}); return; }
+      remote = merge ? { ...(remote || {}), ...(m.data || {}) } : m.data;
+      onNode(remote);
+    };
+    es.addEventListener("put", e => ev(e, false));
+    es.addEventListener("patch", e => ev(e, true));
+    es.addEventListener("open", () => { backoff = 1000; api.status("cloud"); });
+    es.addEventListener("cancel", () => { api.status("err"); es.close(); rt = setTimeout(open, 30000); });
+    es.onerror = () => { api.status("err");
+      if (es.readyState === 2) { clearTimeout(rt); rt = setTimeout(open, backoff); backoff = Math.min(backoff * 2, 30000); } };
+  };
+
+  const flush = () => { if (pt) { clearTimeout(pt); send(true); } };
+  const vis = () => { if (document.visibilityState === "visible") open(); else flush(); };
+  document.addEventListener("visibilitychange", vis);
+  window.addEventListener("pagehide", flush);
+  window.addEventListener("online", open);
+  open();
+
+  return { push,
+    stop() { dead = true; clearTimeout(pt); clearTimeout(rt); if (es) es.close();
+      document.removeEventListener("visibilitychange", vis); window.removeEventListener("pagehide", flush); window.removeEventListener("online", open); } };
+}
 const fmt = t => new Date(t).toLocaleString("zh-TW", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
 const bal = k => k.points - (k.spent || 0);
 const toPhoto = file => new Promise((res, rej) => {
@@ -139,6 +221,8 @@ function App() {
   const [data, setData] = useState(() => { try { const r = localStorage.getItem(KEY); if (r) return JSON.parse(r); } catch (e) {} return INIT; });
   const [tab, setTab] = useState("kids");
   const [sync, setSync] = useState("local");
+  const [cfg, setCfg] = useState(loadCfg);
+  const engine = useRef(null);
   const [unlocked, setUnlocked] = useState(false);
   const [modal, setModal] = useState(null);
   const [pinAsk, setPinAsk] = useState(null);
@@ -162,10 +246,23 @@ function App() {
     return () => un();
   }, []);
 
+  useEffect(() => {
+    if (!cfg) return;
+    const eng = startSync(cfg, {
+      get: () => dataRef.current,
+      apply: d => { dataRef.current = d; setData(d); try { localStorage.setItem(KEY, JSON.stringify(d)); } catch (e) {} },
+      status: setSync });
+    engine.current = eng;
+    return () => { eng.stop(); engine.current = null; setSync("local"); };
+  }, [cfg && cfg.url, cfg && cfg.code]);
+
   const commit = fn => {
-    const nd = fn(dataRef.current); dataRef.current = nd; setData(nd);
+    const cur = dataRef.current;
+    const nd = { ...fn(cur), u: Math.max(Date.now(), (cur.u || 0) + 1) };   // u：最後修改時間（保證單調遞增）
+    dataRef.current = nd; setData(nd);
     try { localStorage.setItem(KEY, JSON.stringify(nd)); } catch (e) {}
     if (ref.current) ref.current.set(nd).catch(() => setSync("ro"));
+    if (engine.current) engine.current.push();
   };
   const guard = fn => { if (!data.pin || unlocked) fn(); else setPinAsk(() => fn); };
   const addLog = (d, k, note, type) => ({ id: uid(), kid: k.id, kn: k.name, d, note, type, t: Date.now() });
@@ -179,7 +276,7 @@ function App() {
     commit(s => ({ ...s, kids: [...s.kids, { id: uid(), name: n, emoji, color: COLORS[s.kids.length % COLORS.length], points: 0, spent: 0, photo }] }));
     setName(""); setPhoto(""); setEmoji(EMOJIS[(data.kids.length + 1) % EMOJIS.length]); };
 
-  const syncLabel = { cloud: "☁️ 已同步", local: "📴 僅存本機", ro: "👀 唯讀（無寫入權限）" }[sync];
+  const syncLabel = { cloud: "☁️ 已同步", wait: "🔄 連線中…", err: "⚠️ 同步中斷，自動重試中", local: "📴 僅存本機", ro: "👀 唯讀（無寫入權限）" }[sync];
   const tabs = [["kids", "👧 小朋友"], ["rewards", "🎁 獎勵"], ["log", "📜 紀錄"], ["set", "⚙️ 設定"]];
 
   return (
@@ -232,7 +329,7 @@ function App() {
           {data.log.length === 0 && <p className="text-center text-stone-400 py-10">還沒有紀錄</p>}</div>
       </div>}
 
-      {tab === "set" && <SettingsTab data={data} guard={guard} commit={commit} sync={sync} setUnlocked={setUnlocked} />}
+      {tab === "set" && <SettingsTab data={data} guard={guard} commit={commit} sync={sync} cfg={cfg} setCfg={setCfg} setUnlocked={setUnlocked} />}
 
       {modal && modal.t === "pt" && <PointModal kid={modal.k} onClose={() => setModal(null)} onSave={(d, n) => { addPts(modal.k, d, n); setModal(null); }} />}
       {modal && modal.t === "rd" && <RedeemModal kid={data.kids.find(k => k.id === modal.k.id) || modal.k} rewards={data.rewards} onClose={() => setModal(null)} onRedeem={r => { redeem(modal.k, r); setModal(null); }} />}
@@ -272,7 +369,70 @@ function RewardsTab({ data, guard, commit }) {
     </div>);
 }
 
-function SettingsTab({ data, guard, commit, sync, setUnlocked }) {
+const RULES = `{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "stamp": {
+      "$code": {
+        ".read": true,
+        ".write": true,
+        ".validate": "newData.hasChildren(['u','by','json']) && newData.child('json').isString() && newData.child('json').val().length < 900000"
+      }
+    }
+  }
+}`;
+function SyncCard({ card, sync, cfg, setCfg, guard }) {
+  const [url, setUrl] = useState(""), [code, setCode] = useState(""), [m, setM] = useState(""), [busy, setBusy] = useState(false), [link, setLink] = useState("");
+  const copy = async t => { try { await navigator.clipboard.writeText(t); return true; } catch (e) { return false; } };
+  const start = async () => {
+    let u; try { const x = new URL(/^https?:\/\//i.test(url.trim()) ? url.trim() : "https://" + url.trim()); if (x.protocol !== "https:") throw 0; u = x.origin; } catch (e) { return setM("資料庫網址格式不正確"); }
+    const c = code.trim(); if (!CODE_RE.test(c)) return setM("同步密碼需為 12–64 個英數字元（可按 🎲 自動產生）");
+    setBusy(true); setM("");
+    try { const r = await fetch(nodeUrl({ url: u, code: c }));
+      if (!r.ok) { setM(r.status === 401 || r.status === 403 ? "權限不足：請確認 Firebase 規則已貼上並按「發布」" : "連線失敗（HTTP " + r.status + "），請確認網址"); }
+      else { const c2 = { url: u, code: c }; try { localStorage.setItem(CFG_KEY, JSON.stringify(c2)); } catch (e) {} setCfg(c2); setUrl(""); setCode(""); setM(""); }
+    } catch (e) { setM("無法連線，請確認網址是否正確、網路是否正常"); }
+    setBusy(false);
+  };
+  const stop = () => { try { localStorage.removeItem(CFG_KEY); } catch (e) {} setCfg(null); setLink(""); setM("已停止同步，資料仍保留在這台裝置與雲端"); };
+  const mkLink = async () => {
+    const l = location.href.split("#")[0] + "#sync=" + encodeURIComponent(btoa(JSON.stringify({ u: cfg.url, c: cfg.code })));
+    setLink(l); setM((await copy(l)) ? "已複製連結，傳到手機開啟即可" : "請長按複製下方連結，傳到手機開啟");
+  };
+  const lab = "text-sm text-stone-500 dark:text-stone-400";
+  return (
+    <div className={card}><h3 className="font-bold mb-2">☁️ 多裝置同步（Firebase 免費方案）</h3>
+      {cfg ? <>
+        <p className={lab}>{sync === "cloud" ? "已連線：電腦、手機各開一次頁面就會即時同步；兩台同時修改時，以最後修改的那台為準。" : sync === "err" ? "目前連不上雲端，恢復網路後會自動重試與合併。" : "連線中…"}</p>
+        <p className="text-xs text-stone-400 mt-1 break-all">資料庫：{cfg.url}</p>
+        <div className="flex gap-2 mt-3">
+          <button onClick={() => guard(mkLink)} className={btn + "flex-1 h-11 bg-sky-500 text-white"}>📱 產生手機設定連結</button>
+          <button onClick={() => guard(stop)} className={btn + "px-4 h-11 bg-stone-200 dark:bg-stone-700"}>停止同步</button></div>
+        {link && <textarea readOnly value={link} onFocus={e => e.target.select()} rows={3} className={inp + " h-auto py-2 text-xs font-mono mt-2"} />}
+      </> : <>
+        <p className={lab}>{sync === "local" ? "目前資料只存在這台裝置。設定一次雲端後，電腦與手機即可即時同步。" : "已透過其他方式連線。"}</p>
+        <details className="mt-2 text-sm"><summary className="cursor-pointer font-semibold text-orange-500">📖 第一次設定步驟（約 5 分鐘）</summary>
+          <ol className="list-decimal pl-5 mt-2 space-y-1 text-stone-600 dark:text-stone-300">
+            <li>到 <b>console.firebase.google.com</b>，用 Google 帳號「建立專案」（Analytics 可關閉）。</li>
+            <li>左側選 <b>建構 → Realtime Database → 建立資料庫</b>，位置選 Singapore，起始模式選「鎖定模式」。</li>
+            <li>進入「規則」分頁，把內容換成下方規則，按「發布」。</li>
+            <li>回到「資料」分頁，複製最上方網址（<code>https://…firebasedatabase.app</code>），貼到下面。</li>
+            <li>按 🎲 產生同步密碼 → 開始同步。再按「產生手機設定連結」傳到手機開啟。</li></ol>
+          <pre className="mt-2 p-2 rounded-xl bg-stone-100 dark:bg-stone-900 text-[11px] overflow-x-auto">{RULES}</pre>
+          <button onClick={async () => setM((await copy(RULES)) ? "規則已複製" : "請手動選取複製規則")} className="text-xs text-sky-600 mt-1">複製規則</button>
+        </details>
+        <input value={url} onChange={e => setUrl(e.target.value)} placeholder="資料庫網址 https://xxxx.firebasedatabase.app" className={inp + " mt-3 text-sm"} />
+        <div className="flex gap-2 mt-2">
+          <input value={code} onChange={e => setCode(e.target.value)} placeholder="同步密碼（12 碼以上英數字）" className={inp + " text-sm font-mono"} />
+          <button onClick={() => setCode(newCode())} aria-label="產生密碼" className={btn + "w-12 h-12 bg-stone-100 dark:bg-stone-700 text-xl"}>🎲</button></div>
+        <button disabled={busy || !url.trim() || !code.trim()} onClick={() => guard(start)} className={btn + "w-full h-11 mt-2 bg-orange-500 text-white disabled:opacity-40"}>{busy ? "測試連線中…" : "開始同步"}</button>
+        <p className="text-xs text-stone-400 mt-2">同步密碼就是資料在雲端的「門牌」，知道網址＋密碼的人才讀得到，請勿公開。</p>
+      </>}
+      {m && <p className="text-sm text-orange-500 mt-2">{m}</p>}
+    </div>);
+}
+function SettingsTab({ data, guard, commit, sync, cfg, setCfg, setUnlocked }) {
   const [pin, setPin] = useState(""), [txt, setTxt] = useState(""), [msg, setMsg] = useState(""), [ok, setOk] = useState(false);
   const exportStr = () => JSON.stringify({ app: "stamp-card", ver: 2, at: new Date().toISOString(), data }, null, 2);
   const save = async () => {
@@ -288,8 +448,7 @@ function SettingsTab({ data, guard, commit, sync, setUnlocked }) {
   const card = "rounded-3xl bg-white dark:bg-stone-800 shadow p-4 mb-4 ";
   return (
     <div>
-      <div className={card}><h3 className="font-bold mb-2">☁️ 多裝置同步</h3>
-        <p className="text-sm text-stone-500 dark:text-stone-400">{sync === "cloud" ? "已連線，所有登入同一組織／被授權的裝置會即時同步。" : sync === "ro" ? "目前帳號沒有寫入權限，僅能檢視。" : "目前無雲端連線，資料只存在這台裝置，可用下方備份轉移。"}</p></div>
+      <SyncCard card={card} sync={sync} cfg={cfg} setCfg={setCfg} guard={guard} />
       <div className={card}><h3 className="font-bold mb-2">🔒 家長 PIN 碼</h3>
         <div className="flex gap-2"><input type="password" inputMode="numeric" maxLength={6} value={pin} onChange={e => setPin(e.target.value.replace(/\D/g, ""))} placeholder="4–6 位數字" className={inp} />
           <button disabled={pin.length < 4} onClick={() => guard(async () => { const h = await sha(pin); commit(s => ({ ...s, pin: h })); setPin(""); setUnlocked(false); setMsg("PIN 已設定，已鎖定"); })} className={btn + "px-4 h-12 bg-orange-500 text-white disabled:opacity-40"}>設定</button></div>
