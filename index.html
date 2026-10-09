@@ -4,9 +4,25 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>小朋友集點卡</title>
+<!--
+  ===== 自架網站版：使用說明 =====
+  1. 這是單一 HTML 檔，直接上傳到任何靜態網站空間即可使用（Firebase Hosting、GitHub Pages、Netlify、Cloudflare Pages…）。
+  2. 沒有設定 Firebase 時，資料只存在這台裝置的瀏覽器（localStorage），仍可用「設定 → 匯出／匯入備份」轉移。
+  3. 想要多裝置同步：到 Firebase 建立專案 → 新增 Web App → 建立 Firestore 資料庫，
+     把 Web App 的設定貼到下方 FIREBASE_CONFIG，並把 FAMILY_CODE 改成一長串只有你知道的隨機英數字。
+  4. Firestore 規則建議（只允許用 FAMILY_CODE 讀寫單一文件，不開放列出其他文件）：
+       rules_version = '2';
+       service cloud.firestore {
+         match /databases/{db}/documents {
+           match /families/{code} { allow get, create, update: if true; allow list, delete: if false; }
+         }
+       }
+-->
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
 <style>
   :root { box-sizing: border-box; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); --bg:#fff7ed; }
@@ -15,18 +31,55 @@
   body { background: var(--bg); font-family: "PingFang TC","Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; }
   @keyframes pop { 0%{transform:scale(0)} 70%{transform:scale(1.3)} 100%{transform:scale(1)} }
   .pop { animation: pop .35s ease-out; }
+  @keyframes shake { 0%,100%{transform:rotate(0) scale(1)} 20%{transform:rotate(-18deg) scale(1.1)} 40%{transform:rotate(16deg) scale(1.15)} 60%{transform:rotate(-14deg) scale(1.1)} 80%{transform:rotate(12deg) scale(1.05)} }
+  .shake { animation: shake .5s ease-in-out infinite; }
+  @keyframes float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-8px)} }
+  .float { animation: float 2s ease-in-out infinite; }
 </style>
 </head>
 <body>
 <div id="root"></div>
 <script type="text/babel">
+// ===== 自架網站設定 =====
+const FIREBASE_CONFIG = null; // 例：{ apiKey: "...", authDomain: "...", projectId: "...", appId: "..." }
+const FAMILY_CODE = "請改成一長串隨機英數字";
 const { useState, useEffect, useRef } = React;
 const PER = 10;
 const COLORS = ["#f97316","#ec4899","#8b5cf6","#0ea5e9","#10b981","#eab308"];
 const EMOJIS = ["🐶","🐱","🐰","🐼","🦁","🐸","🦄","🐯"];
 const KEY = "stamp-card-v2";
 const uid = () => Math.random().toString(36).slice(2, 9);
-const INIT = { kids: [], log: [], pin: "", rewards: [
+const pad2 = n => String(n).padStart(2, "0");
+const ymd = d => d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+const weekStart = (d = new Date()) => { const x = new Date(d.getFullYear(), d.getMonth(), d.getDate()); x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); return x; };
+const DAYS = ["一", "二", "三", "四", "五", "六", "日"];
+const TASKS0 = [
+  { id: "t1", emoji: "🪥", name: "自己刷牙", pts: 1, mode: "daily" },
+  { id: "t2", emoji: "🧸", name: "收玩具", pts: 1, mode: "daily" },
+  { id: "t3", emoji: "🗑️", name: "幫忙倒垃圾", pts: 2, mode: "weekly" } ];
+function pickPrize(lk, kid) {
+  const avail = lk.prizes.filter(p => (p.stock == null || p.stock > 0) && p.weight > 0);
+  const pt = { on: false, n: 10, ...(lk.pity || {}) };
+  const big = avail.filter(p => p.big);
+  let pool = avail;
+  if (pt.on && big.length && (kid.miss || 0) >= pt.n - 1) pool = big;
+  let r = Math.random() * pool.reduce((a, p) => a + p.weight, 0), pick = pool[pool.length - 1];
+  for (const p of pool) { if (r < p.weight) { pick = p; break; } r -= p.weight; }
+  return pick;
+}
+function pityInfo(lk, kid) {
+  const pt = { on: false, n: 10, ...(lk.pity || {}) };
+  const hasBig = lk.prizes.some(p => p.big && p.weight > 0 && (p.stock == null || p.stock > 0));
+  if (!pt.on || !hasBig) return "";
+  const left = pt.n - (kid.miss || 0);
+  return left <= 1 ? "這次必中大獎！" : left + " 次內必中大獎";
+}
+const LUCKY0 = { cost: 5, pity: { on: false, n: 10 }, prizes: [
+  { id: "l1", emoji: "🍭", name: "小糖果", weight: 50, stock: null },
+  { id: "l2", emoji: "🎈", name: "氣球", weight: 30, stock: null },
+  { id: "l3", emoji: "🧸", name: "小玩具", weight: 15, stock: 3 },
+  { id: "l4", emoji: "🎡", name: "遊樂園一次", weight: 5, stock: 1, big: true } ] };
+const INIT = { kids: [], log: [], pin: "", lucky: LUCKY0, tasks: TASKS0, done: {}, rewards: [
   { id: "r1", emoji: "📺", name: "看卡通 30 分鐘", cost: 10 },
   { id: "r2", emoji: "🍦", name: "冰淇淋一支", cost: 20 },
   { id: "r3", emoji: "🧸", name: "小玩具一個", cost: 50 } ] };
@@ -34,88 +87,6 @@ async function sha(s) {
   try { const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("sc:" + s));
     return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join(""); }
   catch (e) { return "p:" + btoa(s); }
-}
-/* ===== 雲端同步（Firebase Realtime Database，REST + SSE，免安裝 SDK）=====
-   整份資料存成 { u: 最後修改時間, by: 裝置ID, json: 字串 }，以 u 較新者為準（最後改的那台贏）。 */
-const CFG_KEY = "stamp-card-sync";
-const DEV = (() => { try { let d = localStorage.getItem("stamp-card-dev"); if (!d) { d = uid() + uid(); localStorage.setItem("stamp-card-dev", d); } return d; } catch (e) { return uid() + uid(); } })();
-const loadCfg = () => { try { const c = JSON.parse(localStorage.getItem(CFG_KEY)); return c && c.url && c.code ? c : null; } catch (e) { return null; } };
-const nodeUrl = c => c.url + "/stamp/" + encodeURIComponent(c.code) + ".json";
-const hasContent = d => !!d && ((d.kids && d.kids.length) || (d.log && d.log.length));
-const newCode = () => { const a = new Uint8Array(20); crypto.getRandomValues(a); return [...a].map(x => "abcdefghijkmnpqrstuvwxyz23456789"[x % 32]).join(""); };
-const CODE_RE = /^[A-Za-z0-9_-]{12,64}$/;
-(function () { // 開啟「手機設定連結」時自動套用設定
-  try { const m = location.hash.match(/#sync=([^&]+)/); if (!m) return;
-    const o = JSON.parse(atob(decodeURIComponent(m[1])));
-    history.replaceState(null, "", location.pathname + location.search);
-    if (/^https:\/\//.test(o.u) && CODE_RE.test(o.c)) localStorage.setItem(CFG_KEY, JSON.stringify({ url: o.u, code: o.c }));
-  } catch (e) {}
-})();
-
-function startSync(cfg, api) {
-  let es = null, pt = null, rt = null, dead = false, backoff = 1000, sentU = 0;
-  const url = nodeUrl(cfg);
-
-  const send = async keep => {
-    pt = null; if (dead) return;
-    const d = api.get(); if (!d.u || d.u <= sentU) return;
-    const prev = sentU, u = d.u;
-    const body = JSON.stringify({ u, by: DEV, json: JSON.stringify(d) });
-    sentU = u;
-    try {
-      const r = await fetch(url, { method: "PUT", body, keepalive: !!keep && body.length < 60000 });
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      api.status("cloud");
-    } catch (e) {
-      if (sentU === u) sentU = prev;
-      api.status("err"); if (!dead) push(5000);
-    }
-  };
-  const push = (delay = 300) => { clearTimeout(pt); pt = setTimeout(send, delay); };
-
-  const onNode = node => {
-    const l = api.get();
-    if (!node || typeof node.json !== "string") {            // 雲端還是空的：把本機資料放上去
-      if (hasContent(l)) { if (!l.u) api.apply({ ...l, u: Date.now() }); push(0); }
-      return;
-    }
-    const ru = +node.u || 0, lu = l.u || 0;
-    if (ru > lu) {                                            // 雲端比較新：套用
-      try { const d = JSON.parse(node.json); if (Array.isArray(d.kids)) api.apply({ ...INIT, ...d, u: ru }); } catch (e) {}
-    } else if (ru < lu && lu > sentU) push(0);                // 本機比較新且還沒送出：上傳
-  };
-
-  const open = () => {
-    if (dead) return;
-    clearTimeout(rt); if (es) es.close();
-    api.status("wait");
-    es = new EventSource(url);
-    let remote = null;
-    const ev = (e, merge) => {
-      let m; try { m = JSON.parse(e.data); } catch (x) { return; } if (!m) return;
-      const p = m.path || "/";
-      if (p !== "/") { fetch(url).then(r => r.json()).then(onNode).catch(() => {}); return; }
-      remote = merge ? { ...(remote || {}), ...(m.data || {}) } : m.data;
-      onNode(remote);
-    };
-    es.addEventListener("put", e => ev(e, false));
-    es.addEventListener("patch", e => ev(e, true));
-    es.addEventListener("open", () => { backoff = 1000; api.status("cloud"); });
-    es.addEventListener("cancel", () => { api.status("err"); es.close(); rt = setTimeout(open, 30000); });
-    es.onerror = () => { api.status("err");
-      if (es.readyState === 2) { clearTimeout(rt); rt = setTimeout(open, backoff); backoff = Math.min(backoff * 2, 30000); } };
-  };
-
-  const flush = () => { if (pt) { clearTimeout(pt); send(true); } };
-  const vis = () => { if (document.visibilityState === "visible") open(); else flush(); };
-  document.addEventListener("visibilitychange", vis);
-  window.addEventListener("pagehide", flush);
-  window.addEventListener("online", open);
-  open();
-
-  return { push,
-    stop() { dead = true; clearTimeout(pt); clearTimeout(rt); if (es) es.close();
-      document.removeEventListener("visibilitychange", vis); window.removeEventListener("pagehide", flush); window.removeEventListener("online", open); } };
 }
 const fmt = t => new Date(t).toLocaleString("zh-TW", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
 const bal = k => k.points - (k.spent || 0);
@@ -178,17 +149,42 @@ function PointModal({ kid, onSave, onClose }) {
     </Modal>);
 }
 
-function RedeemModal({ kid, rewards, onRedeem, onClose }) {
+function RedeemModal({ kid, rewards, lucky, onRedeem, onDraw, onClose }) {
+  const [phase, setPhase] = useState("idle"), [res, setRes] = useState(null);
+  const tm = useRef(null);
+  useEffect(() => () => clearTimeout(tm.current), []);
+  const avail = lucky.prizes.filter(p => (p.stock == null || p.stock > 0) && p.weight > 0);
+  const total = avail.reduce((a, p) => a + p.weight, 0);
+  const canDraw = bal(kid) >= lucky.cost && avail.length > 0 && phase !== "shaking";
+  const go = () => {
+    const pick = pickPrize(lucky, kid);
+    onDraw(kid, pick, lucky.cost); setRes(null); setPhase("shaking");
+    tm.current = setTimeout(() => { setRes(pick); setPhase("result"); }, 1500);
+  };
   return (
     <Modal title={"🎁 " + kid.name + " 兌換（可用 " + bal(kid) + " 點）"} onClose={onClose}>
-      {rewards.length === 0 && <p className="text-stone-400">尚未設定獎勵，請到「獎勵」頁新增。</p>}
-      <div className="space-y-2">{rewards.map(r => { const ok = bal(kid) >= r.cost; return (
-        <button key={r.id} disabled={!ok} onClick={() => onRedeem(r)}
-          className={btn + "w-full flex items-center gap-3 p-3 text-left border-2 " + (ok ? "border-orange-300 bg-orange-50 dark:bg-stone-700" : "border-stone-200 dark:border-stone-700 opacity-40")}>
-          <span className="text-2xl">{r.emoji}</span><span className="flex-1">{r.name}</span><b>{r.cost} 點</b></button>); })}</div>
+      {phase !== "idle" ? (
+        <div className="text-center">
+          <div className="h-36 flex items-center justify-center">
+            {phase === "result" && res ? <div className="pop"><div className="text-7xl">{res.emoji}</div><div className="font-extrabold text-lg mt-1">恭喜抽到「{res.name}」！</div></div>
+              : <div className="text-8xl shake">🎰</div>}</div>
+          {phase === "shaking" ? <p className="text-stone-500">抽獎中…</p> : <div className="flex gap-2">
+            <button disabled={!canDraw} onClick={go} className={btn + "flex-1 h-12 text-white bg-gradient-to-r from-orange-500 to-pink-500 disabled:opacity-40"}>再抽一次（{lucky.cost} 點）</button>
+            <button onClick={() => { setPhase("idle"); setRes(null); }} className={btn + "px-4 h-12 bg-stone-100 dark:bg-stone-700"}>返回</button></div>}
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <button disabled={!canDraw} onClick={go}
+            className={btn + "w-full flex items-center gap-3 p-3 text-left text-white bg-gradient-to-r from-orange-500 to-pink-500 shadow " + (canDraw ? "" : "opacity-40")}>
+            <span className="text-2xl">🎰</span><span className="flex-1">抽抽樂<span className="block text-xs opacity-90">{avail.length ? "隨機抽一個獎品" + (pityInfo(lucky, kid) ? "・🛡️ " + pityInfo(lucky, kid) : "") : "獎品都被抽完了"}</span></span><b>{lucky.cost} 點</b></button>
+          {rewards.length === 0 && <p className="text-stone-400 text-sm pt-2">尚未設定固定獎勵，可到「獎勵」頁新增。</p>}
+          {rewards.map(r => { const ok = bal(kid) >= r.cost; return (
+            <button key={r.id} disabled={!ok} onClick={() => onRedeem(r)}
+              className={btn + "w-full flex items-center gap-3 p-3 text-left border-2 " + (ok ? "border-orange-300 bg-orange-50 dark:bg-stone-700" : "border-stone-200 dark:border-stone-700 opacity-40")}>
+              <span className="text-2xl">{r.emoji}</span><span className="flex-1">{r.name}</span><b>{r.cost} 點</b></button>); })}
+        </div>)}
     </Modal>);
 }
-
 function KidCard({ kid, onPhoto, onAdd, onCustom, onRedeem, onDelete }) {
   const [c, setC] = useState(false);
   const done = Math.floor(kid.points / PER), f = kid.points % PER;
@@ -221,8 +217,6 @@ function App() {
   const [data, setData] = useState(() => { try { const r = localStorage.getItem(KEY); if (r) return JSON.parse(r); } catch (e) {} return INIT; });
   const [tab, setTab] = useState("kids");
   const [sync, setSync] = useState("local");
-  const [cfg, setCfg] = useState(loadCfg);
-  const engine = useRef(null);
   const [unlocked, setUnlocked] = useState(false);
   const [modal, setModal] = useState(null);
   const [pinAsk, setPinAsk] = useState(null);
@@ -235,8 +229,9 @@ function App() {
     let un = () => {};
     (async () => {
       try {
-        const db = window.claude && await window.claude.use("db"); if (!db) return;
-        ref.current = db.doc("cards/state");
+        if (!FIREBASE_CONFIG || !window.firebase) return;
+        if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+        ref.current = firebase.firestore().collection("families").doc(FAMILY_CODE);
         un = ref.current.onSnapshot(s => {
           if (s.exists) { const d = s.data(); setData(d); try { localStorage.setItem(KEY, JSON.stringify(d)); } catch (e) {} setSync("cloud"); }
           else ref.current.set(dataRef.current).then(() => setSync("cloud")).catch(() => setSync("ro"));
@@ -246,23 +241,10 @@ function App() {
     return () => un();
   }, []);
 
-  useEffect(() => {
-    if (!cfg) return;
-    const eng = startSync(cfg, {
-      get: () => dataRef.current,
-      apply: d => { dataRef.current = d; setData(d); try { localStorage.setItem(KEY, JSON.stringify(d)); } catch (e) {} },
-      status: setSync });
-    engine.current = eng;
-    return () => { eng.stop(); engine.current = null; setSync("local"); };
-  }, [cfg && cfg.url, cfg && cfg.code]);
-
   const commit = fn => {
-    const cur = dataRef.current;
-    const nd = { ...fn(cur), u: Math.max(Date.now(), (cur.u || 0) + 1) };   // u：最後修改時間（保證單調遞增）
-    dataRef.current = nd; setData(nd);
+    const nd = fn(dataRef.current); dataRef.current = nd; setData(nd);
     try { localStorage.setItem(KEY, JSON.stringify(nd)); } catch (e) {}
     if (ref.current) ref.current.set(nd).catch(() => setSync("ro"));
-    if (engine.current) engine.current.push();
   };
   const guard = fn => { if (!data.pin || unlocked) fn(); else setPinAsk(() => fn); };
   const addLog = (d, k, note, type) => ({ id: uid(), kid: k.id, kn: k.name, d, note, type, t: Date.now() });
@@ -276,8 +258,31 @@ function App() {
     commit(s => ({ ...s, kids: [...s.kids, { id: uid(), name: n, emoji, color: COLORS[s.kids.length % COLORS.length], points: 0, spent: 0, photo }] }));
     setName(""); setPhoto(""); setEmoji(EMOJIS[(data.kids.length + 1) % EMOJIS.length]); };
 
-  const syncLabel = { cloud: "☁️ 已同步", wait: "🔄 連線中…", err: "⚠️ 同步中斷，自動重試中", local: "📴 僅存本機", ro: "👀 唯讀（無寫入權限）" }[sync];
-  const tabs = [["kids", "👧 小朋友"], ["rewards", "🎁 獎勵"], ["log", "📜 紀錄"], ["set", "⚙️ 設定"]];
+  const draw = (k, p, cost) => commit(s => { const lk = s.lucky || LUCKY0; return { ...s,
+    lucky: { ...lk, prizes: lk.prizes.map(x => x.id === p.id && x.stock != null ? { ...x, stock: Math.max(0, x.stock - 1) } : x) },
+    kids: s.kids.map(x => x.id === k.id ? { ...x, spent: (x.spent || 0) + cost, miss: p.big ? 0 : (x.miss || 0) + 1 } : x),
+    log: [addLog(-cost, k, p.emoji + " " + p.name, "draw"), ...s.log].slice(0, 500) }; });
+
+  const addMany = (ids, d, note) => commit(s => ({ ...s,
+    kids: s.kids.map(x => ids.includes(x.id) ? { ...x, points: Math.max(0, x.points + d) } : x),
+    log: [...s.kids.filter(k => ids.includes(k.id)).map(k => addLog(d, k, note, "add")), ...s.log].slice(0, 500) }));
+
+  const toggleTask = (k, t, slot, wk) => commit(s => {
+    const key = wk + "|" + k.id + "|" + t.id + "|" + slot;
+    const done = { ...(s.done || {}) };
+    const was = !!done[key];
+    if (was) delete done[key]; else done[key] = Date.now();
+    const cut = new Date(); cut.setDate(cut.getDate() - 84); const cutKey = ymd(weekStart(cut));
+    Object.keys(done).forEach(x => { if (x.split("|")[0] < cutKey) delete done[x]; });
+    const d = was ? -t.pts : t.pts;
+    const note = (was ? "取消任務：" : "任務：") + t.emoji + " " + t.name + (t.mode === "weekly" ? "" : "（週" + DAYS[slot] + "）");
+    return { ...s, done,
+      kids: s.kids.map(x => x.id === k.id ? { ...x, points: Math.max(0, x.points + d) } : x),
+      log: [addLog(d, k, note, "add"), ...s.log].slice(0, 500) };
+  });
+
+  const syncLabel = { cloud: "☁️ 已同步", local: "📴 僅存本機", ro: "👀 唯讀（無寫入權限）" }[sync];
+  const tabs = [["kids", "👧 小朋友"], ["tasks", "📋 每週任務"], ["rewards", "🎁 獎勵"], ["lucky", "🎰 抽抽樂"], ["log", "📜 紀錄"], ["set", "⚙️ 設定"]];
 
   return (
     <div className="max-w-5xl mx-auto p-4 sm:p-6 text-stone-800 dark:text-stone-100">
@@ -304,6 +309,7 @@ function App() {
             <input value={name} onChange={e => setName(e.target.value)} onKeyDown={e => e.key === "Enter" && guard(addKid)} placeholder="輸入小朋友的名字" maxLength={12} className={inp} />
             <button onClick={() => guard(addKid)} className={btn + "px-5 h-12 bg-orange-500 text-white"}>新增</button></div>
         </div>
+        {data.kids.length > 1 && <BatchBar kids={data.kids} guard={guard} onSave={addMany} />}
         {data.kids.length === 0 ? <div className="text-center py-16 text-stone-400"><div className="text-6xl mb-3">🎈</div>先新增一位小朋友吧！</div> :
           <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">{data.kids.map(k => (
             <KidCard key={k.id} kid={k}
@@ -314,6 +320,8 @@ function App() {
               onDelete={() => guard(() => commit(s => ({ ...s, kids: s.kids.filter(x => x.id !== k.id) })))} />))}</div>}
       </>}
 
+      {tab === "tasks" && <TasksTab data={data} guard={guard} commit={commit} onToggle={toggleTask} />}
+      {tab === "lucky" && <LuckyTab data={data} guard={guard} commit={commit} onDraw={draw} />}
       {tab === "rewards" && <RewardsTab data={data} guard={guard} commit={commit} />}
 
       {tab === "log" && <div>
@@ -329,25 +337,185 @@ function App() {
           {data.log.length === 0 && <p className="text-center text-stone-400 py-10">還沒有紀錄</p>}</div>
       </div>}
 
-      {tab === "set" && <SettingsTab data={data} guard={guard} commit={commit} sync={sync} cfg={cfg} setCfg={setCfg} setUnlocked={setUnlocked} />}
+      {tab === "set" && <SettingsTab data={data} guard={guard} commit={commit} sync={sync} setUnlocked={setUnlocked} />}
 
       {modal && modal.t === "pt" && <PointModal kid={modal.k} onClose={() => setModal(null)} onSave={(d, n) => { addPts(modal.k, d, n); setModal(null); }} />}
-      {modal && modal.t === "rd" && <RedeemModal kid={data.kids.find(k => k.id === modal.k.id) || modal.k} rewards={data.rewards} onClose={() => setModal(null)} onRedeem={r => { redeem(modal.k, r); setModal(null); }} />}
+      {modal && modal.t === "rd" && <RedeemModal kid={data.kids.find(k => k.id === modal.k.id) || modal.k} rewards={data.rewards} lucky={data.lucky || LUCKY0} onDraw={draw} onClose={() => setModal(null)} onRedeem={r => { redeem(modal.k, r); setModal(null); }} />}
       {pinAsk && <PinModal pin={data.pin} onClose={() => setPinAsk(null)} onOk={() => { setUnlocked(true); const f = pinAsk; setPinAsk(null); f(); }} />}
     </div>);
 }
 
+function BatchBar({ kids, guard, onSave }) {
+  const [open, setOpen] = useState(false);
+  const [sel, setSel] = useState([]), [d, setD] = useState(1), [note, setNote] = useState("");
+  const show = () => guard(() => { setSel(kids.map(k => k.id)); setD(1); setNote(""); setOpen(true); });
+  const toggle = id => setSel(sel.includes(id) ? sel.filter(x => x !== id) : [...sel, id]);
+  const ids = sel.filter(id => kids.some(k => k.id === id));
+  return (
+    <div className="mb-5">
+      <button onClick={show} className={btn + "w-full h-12 bg-gradient-to-r from-amber-400 to-orange-500 text-white shadow"}>👥 多人一起加點</button>
+      {open && <Modal title="👥 多人一起加／扣點" onClose={() => setOpen(false)}>
+        <div className="flex items-center justify-between mb-2 text-sm">
+          <span className="font-semibold">選擇小朋友（已選 {ids.length}/{kids.length}）</span>
+          <span><button onClick={() => setSel(kids.map(k => k.id))} className="text-sky-600 mr-3">全選</button><button onClick={() => setSel([])} className="text-stone-500">全不選</button></span></div>
+        <div className="grid grid-cols-3 gap-2 mb-4">{kids.map(k => { const on = ids.includes(k.id); return (
+          <button key={k.id} onClick={() => toggle(k.id)} className={"relative flex flex-col items-center gap-1 p-2 rounded-2xl border-2 " + (on ? "text-white" : "border-stone-200 dark:border-stone-600 opacity-60")} style={on ? { background: k.color, borderColor: k.color } : {}}>
+            <Avatar kid={k} size="w-12 h-12" t="text-2xl" /><span className="text-xs font-bold max-w-full truncate">{k.name}</span>
+            {on && <span className="absolute top-1 right-1 w-5 h-5 rounded-full bg-white text-xs flex items-center justify-center" style={{ color: k.color }}>✓</span>}</button>); })}</div>
+        <div className="flex items-center gap-3 justify-center mb-3">
+          <button onClick={() => setD(d - 1)} className={btn + "w-12 h-12 bg-stone-100 dark:bg-stone-700 text-xl"}>−</button>
+          <input type="number" value={d} onChange={e => setD(parseInt(e.target.value) || 0)} className={inp + " w-24 text-center text-2xl"} />
+          <button onClick={() => setD(d + 1)} className={btn + "w-12 h-12 bg-stone-100 dark:bg-stone-700 text-xl"}>＋</button></div>
+        <div className="flex gap-2 justify-center mb-3">{[1, 2, 5, 10, -1].map(n => (
+          <button key={n} onClick={() => setD(n)} className={btn + "px-3 h-9 text-sm bg-orange-100 text-orange-700"}>{n > 0 ? "+" : ""}{n}</button>))}</div>
+        <input value={note} onChange={e => setNote(e.target.value)} placeholder="備註（例如：一起完成大掃除）" className={inp} />
+        <button disabled={!d || ids.length === 0} onClick={() => { onSave(ids, d, note); setOpen(false); }} className={btn + "w-full h-12 mt-3 bg-orange-500 text-white disabled:opacity-40"}>
+          確認：{ids.length} 位各 {d > 0 ? "+" : ""}{d} 點</button>
+      </Modal>}
+    </div>);
+}
 function LogRow({ l, kid, onDelete }) {
   const [c, setC] = useState(false);
   return (
     <div className="flex items-center gap-3 rounded-2xl bg-white dark:bg-stone-800 p-3 shadow-sm">
       <div className={"w-12 text-center font-extrabold " + (l.d > 0 ? "text-emerald-500" : "text-rose-500")}>{l.d > 0 ? "+" : ""}{l.d}</div>
       <Avatar kid={kid || { emoji: "👤", color: "#a8a29e" }} size="w-10 h-10" t="text-xl" />
-      <div className="flex-1 min-w-0"><div className="font-semibold truncate">{l.kn}{l.type === "redeem" && <span className="ml-2 text-xs text-amber-600">兌換</span>}</div>
+      <div className="flex-1 min-w-0"><div className="font-semibold truncate">{l.kn}{(l.type === "redeem" || l.type === "draw") && <span className="ml-2 text-xs text-amber-600">{l.type === "draw" ? "抽獎" : "兌換"}</span>}</div>
         <div className="text-xs text-stone-500 dark:text-stone-400 truncate">{l.note || "（無備註）"}</div></div>
       <div className="text-xs text-stone-400">{fmt(l.t)}</div>
       {c ? <div className="flex gap-2 text-sm shrink-0"><button onClick={onDelete} className="text-red-500 font-bold">刪除</button><button onClick={() => setC(false)} className="text-stone-500">取消</button></div>
         : <button onClick={() => setC(true)} aria-label="刪除紀錄" className="shrink-0 w-8 h-8 rounded-full text-stone-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-stone-700">🗑️</button>}
+    </div>);
+}
+function LuckyTab({ data, guard, commit, onDraw }) {
+  const lk = data.lucky || LUCKY0;
+  const pt = { on: false, n: 10, ...(lk.pity || {}) };
+  const [kidId, setKidId] = useState(""), [phase, setPhase] = useState("idle"), [res, setRes] = useState(null);
+  const [n, setN] = useState(""), [e, setE] = useState("🍭"), [w, setW] = useState(10), [st, setSt] = useState(""), [bg, setBg] = useState(false);
+  const tm = useRef(null);
+  useEffect(() => () => clearTimeout(tm.current), []);
+  const kid = data.kids.find(k => k.id === kidId) || data.kids[0];
+  const avail = lk.prizes.filter(p => (p.stock == null || p.stock > 0) && p.weight > 0);
+  const total = avail.reduce((a, p) => a + p.weight, 0);
+  const shaking = phase === "shaking";
+  const canDraw = kid && bal(kid) >= lk.cost && avail.length > 0 && !shaking;
+  const setLk = patch => commit(s => ({ ...s, lucky: { ...(s.lucky || LUCKY0), ...patch } }));
+  const start = () => guard(() => {
+    const pick = pickPrize(lk, kid);
+    onDraw(kid, pick, lk.cost); setRes(null); setPhase("shaking");
+    tm.current = setTimeout(() => { setRes(pick); setPhase("result"); }, 1500);
+  });
+  const addPrize = () => { if (!n.trim()) return;
+    setLk({ prizes: [...lk.prizes, { id: uid(), emoji: e || "🎁", name: n.trim(), weight: w, stock: st === "" ? null : Math.max(0, parseInt(st) || 0), big: bg }] }); setN(""); setSt(""); setBg(false); };
+  if (data.kids.length === 0) return <p className="text-center text-stone-400 py-16">先到「小朋友」頁新增一位小朋友吧！</p>;
+  return (
+    <div>
+      <div className="flex gap-3 overflow-x-auto pb-2 mb-3">{data.kids.map(k => (
+        <button key={k.id} disabled={shaking} onClick={() => { setKidId(k.id); setPhase("idle"); setRes(null); }}
+          className={"shrink-0 flex flex-col items-center gap-1 px-3 py-2 rounded-2xl " + (kid.id === k.id ? "text-white" : "bg-white dark:bg-stone-800")} style={kid.id === k.id ? { background: k.color } : {}}>
+          <Avatar kid={k} size="w-12 h-12" t="text-2xl" /><span className="text-xs font-bold max-w-[4.5rem] truncate">{k.name}</span></button>))}</div>
+
+      <div className="rounded-3xl bg-white dark:bg-stone-800 shadow p-5 mb-4 text-center">
+        <div className="text-sm text-stone-500 dark:text-stone-400 mb-2">{kid.name} 可用 <b className="text-orange-500 text-lg">{bal(kid)}</b> 點・每抽一次 <b>{lk.cost}</b> 點</div>
+        {pityInfo(lk, kid) && <div className="text-xs text-amber-600 mb-1">🛡️ 保底：{pityInfo(lk, kid)}</div>}
+        <div className="h-36 flex items-center justify-center">
+          {phase === "result" && res ? <div className="pop"><div className="text-7xl">{res.emoji}</div><div className="font-extrabold text-lg mt-1">恭喜抽到「{res.name}」！</div></div>
+            : <div className={"text-8xl " + (shaking ? "shake" : "float")}>🎰</div>}
+        </div>
+        <button disabled={!canDraw} onClick={start} className={btn + "w-full h-14 text-lg text-white bg-gradient-to-r from-orange-500 to-pink-500 shadow disabled:opacity-40"}>
+          {shaking ? "抽獎中…" : phase === "result" ? "再抽一次！" : "🎲 開始抽獎"}</button>
+        {!shaking && kid && bal(kid) < lk.cost && <p className="text-xs text-rose-500 mt-2">點數不夠囉，再多集 {lk.cost - bal(kid)} 點就能抽！</p>}
+        {avail.length === 0 && <p className="text-xs text-rose-500 mt-2">獎品都被抽完了，請家長補充獎品。</p>}
+      </div>
+
+      <div className="rounded-3xl bg-white dark:bg-stone-800 shadow p-4 mb-4">
+        <h3 className="font-bold mb-3">🎁 獎品池與機率</h3>
+        <div className="space-y-2">{lk.prizes.map(p => { const out = p.stock != null && p.stock <= 0; return (
+          <div key={p.id} className={"flex items-center gap-3 rounded-2xl bg-stone-50 dark:bg-stone-700 p-3 " + (out ? "opacity-50" : "")}>
+            <span className="text-2xl">{p.emoji}</span>
+            <div className="flex-1 min-w-0"><div className="font-semibold truncate">{p.big && <span className="mr-1">⭐</span>}{p.name}</div>
+              <div className="text-xs text-stone-500 dark:text-stone-400">{out ? "已抽完" : (total ? Math.round(p.weight / total * 100) : 0) + "% 機率"}・{p.stock == null ? "數量不限" : "剩 " + p.stock + " 個"}</div></div>
+            <button onClick={() => guard(() => setLk({ prizes: lk.prizes.map(x => x.id === p.id ? { ...x, big: !x.big } : x) }))} className={"text-xs px-2 h-7 rounded-full " + (p.big ? "bg-amber-400 text-white" : "bg-stone-200 dark:bg-stone-600 text-stone-500 dark:text-stone-300")}>大獎</button>
+            <button onClick={() => guard(() => setLk({ prizes: lk.prizes.filter(x => x.id !== p.id) }))} className="text-stone-400 hover:text-red-500">✕</button></div>); })}</div>
+      </div>
+
+      <div className="rounded-3xl bg-white dark:bg-stone-800 shadow p-4">
+        <h3 className="font-bold mb-3">⚙️ 抽獎設定（家長）</h3>
+        <label className="flex items-center gap-2 mb-3 text-sm">每抽一次需要
+          <input type="number" min="1" value={lk.cost} onChange={x => { const v = Math.max(1, parseInt(x.target.value) || 1); guard(() => setLk({ cost: v })); }} className={inp + " w-24 text-center"} />點</label>
+        <div className="rounded-2xl bg-amber-50 dark:bg-stone-700 p-3 mb-3 text-sm">
+          <label className="flex items-center gap-2 font-semibold"><input type="checkbox" checked={pt.on} onChange={x => { const v = x.target.checked; guard(() => setLk({ pity: { ...pt, on: v } })); }} /> 🛡️ 保底機制</label>
+          <div className="flex items-center gap-2 mt-2 flex-wrap">連續<input type="number" min="2" value={pt.n} onChange={x => { const v = Math.max(2, parseInt(x.target.value) || 2); guard(() => setLk({ pity: { ...pt, n: v } })); }} className={inp + " w-20 text-center"} />次沒抽到大獎，第該次必中大獎</div>
+          <p className="text-xs text-stone-500 dark:text-stone-300 mt-1">先在上方獎品列按「大獎」標記哪些是大獎；每位小朋友各自計算。</p></div>
+        <div className="grid grid-cols-[3rem_1fr] gap-2 mb-2">
+          <input value={e} onChange={x => setE(x.target.value)} className={inp + " px-1 text-center"} />
+          <input value={n} onChange={x => setN(x.target.value)} placeholder="獎品名稱" className={inp} /></div>
+        <div className="grid grid-cols-2 gap-2 mb-2">
+          <label className="text-xs text-stone-500">權重（越大越容易抽中）<input type="number" min="1" value={w} onChange={x => setW(Math.max(1, parseInt(x.target.value) || 1))} className={inp + " mt-1"} /></label>
+          <label className="text-xs text-stone-500">數量（留空＝不限）<input type="number" min="0" value={st} onChange={x => setSt(x.target.value)} className={inp + " mt-1"} /></label></div>
+        <label className="flex items-center gap-2 text-sm mb-2"><input type="checkbox" checked={bg} onChange={x => setBg(x.target.checked)} /> 這是大獎（可用於保底）</label>
+        <button onClick={() => guard(addPrize)} className={btn + "w-full h-11 bg-orange-500 text-white"}>新增獎品</button>
+      </div>
+    </div>);
+}
+function TasksTab({ data, guard, commit, onToggle }) {
+  const tasks = data.tasks || TASKS0;
+  const [kidId, setKidId] = useState(""), [off, setOff] = useState(0);
+  const [n, setN] = useState(""), [e, setE] = useState("✅"), [pts, setPts] = useState(1), [mode, setMode] = useState("daily");
+  if (data.kids.length === 0) return <p className="text-center text-stone-400 py-16">先到「小朋友」頁新增一位小朋友吧！</p>;
+  const kid = data.kids.find(k => k.id === kidId) || data.kids[0];
+  const ws = weekStart(); ws.setDate(ws.getDate() + off * 7);
+  const we = new Date(ws); we.setDate(we.getDate() + 6);
+  const wk = ymd(ws);
+  const todayIdx = off === 0 ? (new Date().getDay() + 6) % 7 : 6;
+  const done = data.done || {};
+  const isDone = (t, slot) => !!done[wk + "|" + kid.id + "|" + t.id + "|" + slot];
+  let cnt = 0, got = 0;
+  tasks.forEach(t => (t.mode === "weekly" ? ["w"] : [0, 1, 2, 3, 4, 5, 6]).forEach(sl => { if (isDone(t, sl)) { cnt++; got += t.pts; } }));
+  const setTasks = fn => commit(s => ({ ...s, tasks: fn(s.tasks || TASKS0) }));
+  const add = () => { if (!n.trim()) return; setTasks(a => [...a, { id: uid(), emoji: e || "✅", name: n.trim(), pts, mode }]); setN(""); };
+  const title = off === 0 ? "本週" : off === -1 ? "上週" : Math.abs(off) + " 週前";
+  return (
+    <div>
+      <div className="flex gap-3 overflow-x-auto pb-2 mb-3">{data.kids.map(k => (
+        <button key={k.id} onClick={() => setKidId(k.id)} className={"shrink-0 flex flex-col items-center gap-1 px-3 py-2 rounded-2xl " + (kid.id === k.id ? "text-white" : "bg-white dark:bg-stone-800")} style={kid.id === k.id ? { background: k.color } : {}}>
+          <Avatar kid={k} size="w-12 h-12" t="text-2xl" /><span className="text-xs font-bold max-w-[4.5rem] truncate">{k.name}</span></button>))}</div>
+
+      <div className="flex items-center justify-between rounded-2xl bg-white dark:bg-stone-800 shadow-sm p-3 mb-3">
+        <button disabled={off <= -4} onClick={() => setOff(off - 1)} className={btn + "w-10 h-10 bg-stone-100 dark:bg-stone-700 disabled:opacity-30"}>◀</button>
+        <div className="text-center"><div className="font-bold">{title}（{ws.getMonth() + 1}/{ws.getDate()} – {we.getMonth() + 1}/{we.getDate()}）</div>
+          <div className="text-xs text-stone-500 dark:text-stone-400">完成 {cnt} 項・賺到 {got} 點</div></div>
+        <button disabled={off >= 0} onClick={() => setOff(off + 1)} className={btn + "w-10 h-10 bg-stone-100 dark:bg-stone-700 disabled:opacity-30"}>▶</button>
+      </div>
+
+      <div className="space-y-3 mb-2">{tasks.map(t => (
+        <div key={t.id} className="rounded-3xl bg-white dark:bg-stone-800 shadow-sm p-4">
+          <div className="flex items-center gap-2 mb-2"><span className="text-2xl">{t.emoji}</span><span className="flex-1 font-semibold">{t.name}</span>
+            <span className="text-xs px-2 py-1 rounded-full bg-orange-100 text-orange-700 font-bold">{t.mode === "weekly" ? "每週一次" : "每天"}・+{t.pts} 點</span></div>
+          {t.mode === "weekly"
+            ? <button onClick={() => guard(() => onToggle(kid, t, "w", wk))} className={btn + "w-full h-11 " + (isDone(t, "w") ? "text-white" : "bg-stone-100 dark:bg-stone-700 text-stone-600 dark:text-stone-300")} style={isDone(t, "w") ? { background: kid.color } : {}}>{isDone(t, "w") ? "✓ 本週已完成" : "完成了！"}</button>
+            : <div className="flex gap-1.5">{DAYS.map((d, i) => { const on = isDone(t, i); return (
+                <button key={i} disabled={off === 0 && i > todayIdx} onClick={() => guard(() => onToggle(kid, t, i, wk))}
+                  className={"flex-1 h-12 rounded-xl text-xs font-bold flex flex-col items-center justify-center disabled:opacity-30 " + (on ? "text-white" : "bg-stone-100 dark:bg-stone-700 text-stone-500 dark:text-stone-300") + (off === 0 && i === todayIdx ? " ring-2 ring-orange-400" : "")}
+                  style={on ? { background: kid.color } : {}}><span>{d}</span><span>{on ? "✓" : "·"}</span></button>); })}</div>}
+        </div>))}
+        {tasks.length === 0 && <p className="text-center text-stone-400 py-8">還沒有任務，請在下方新增。</p>}</div>
+      <p className="text-xs text-stone-400 mb-5">點一下完成並加點，再點一次可取消（會扣回點數）。每週一重新開始。</p>
+
+      <div className="rounded-3xl bg-white dark:bg-stone-800 shadow p-4">
+        <h3 className="font-bold mb-3">⚙️ 管理任務（家長）</h3>
+        <div className="grid grid-cols-[3rem_1fr_5rem] gap-2 mb-2">
+          <input value={e} onChange={x => setE(x.target.value)} className={inp + " px-1 text-center"} />
+          <input value={n} onChange={x => setN(x.target.value)} placeholder="任務名稱" className={inp} />
+          <input type="number" min="1" value={pts} onChange={x => setPts(Math.max(1, parseInt(x.target.value) || 1))} className={inp + " px-2 text-center"} /></div>
+        <select value={mode} onChange={x => setMode(x.target.value)} className={inp + " mb-2"}><option value="daily">每天一次（週一～週日）</option><option value="weekly">每週一次</option></select>
+        <button onClick={() => guard(add)} className={btn + "w-full h-11 bg-orange-500 text-white mb-3"}>新增任務（點數）</button>
+        <div className="space-y-2">{tasks.map(t => (
+          <div key={t.id} className="flex items-center gap-3 rounded-2xl bg-stone-50 dark:bg-stone-700 p-3">
+            <span className="text-xl">{t.emoji}</span><span className="flex-1 truncate">{t.name}</span>
+            <span className="text-xs text-stone-500 dark:text-stone-300">{t.mode === "weekly" ? "每週" : "每天"}・{t.pts} 點</span>
+            <button onClick={() => guard(() => setTasks(a => a.filter(x => x.id !== t.id)))} className="text-stone-400 hover:text-red-500">✕</button></div>))}</div>
+      </div>
     </div>);
 }
 function RewardsTab({ data, guard, commit }) {
@@ -369,77 +537,14 @@ function RewardsTab({ data, guard, commit }) {
     </div>);
 }
 
-const RULES = `{
-  "rules": {
-    ".read": false,
-    ".write": false,
-    "stamp": {
-      "$code": {
-        ".read": true,
-        ".write": true,
-        ".validate": "newData.hasChildren(['u','by','json']) && newData.child('json').isString() && newData.child('json').val().length < 900000"
-      }
-    }
-  }
-}`;
-function SyncCard({ card, sync, cfg, setCfg, guard }) {
-  const [url, setUrl] = useState(""), [code, setCode] = useState(""), [m, setM] = useState(""), [busy, setBusy] = useState(false), [link, setLink] = useState("");
-  const copy = async t => { try { await navigator.clipboard.writeText(t); return true; } catch (e) { return false; } };
-  const start = async () => {
-    let u; try { const x = new URL(/^https?:\/\//i.test(url.trim()) ? url.trim() : "https://" + url.trim()); if (x.protocol !== "https:") throw 0; u = x.origin; } catch (e) { return setM("資料庫網址格式不正確"); }
-    const c = code.trim(); if (!CODE_RE.test(c)) return setM("同步密碼需為 12–64 個英數字元（可按 🎲 自動產生）");
-    setBusy(true); setM("");
-    try { const r = await fetch(nodeUrl({ url: u, code: c }));
-      if (!r.ok) { setM(r.status === 401 || r.status === 403 ? "權限不足：請確認 Firebase 規則已貼上並按「發布」" : "連線失敗（HTTP " + r.status + "），請確認網址"); }
-      else { const c2 = { url: u, code: c }; try { localStorage.setItem(CFG_KEY, JSON.stringify(c2)); } catch (e) {} setCfg(c2); setUrl(""); setCode(""); setM(""); }
-    } catch (e) { setM("無法連線，請確認網址是否正確、網路是否正常"); }
-    setBusy(false);
-  };
-  const stop = () => { try { localStorage.removeItem(CFG_KEY); } catch (e) {} setCfg(null); setLink(""); setM("已停止同步，資料仍保留在這台裝置與雲端"); };
-  const mkLink = async () => {
-    const l = location.href.split("#")[0] + "#sync=" + encodeURIComponent(btoa(JSON.stringify({ u: cfg.url, c: cfg.code })));
-    setLink(l); setM((await copy(l)) ? "已複製連結，傳到手機開啟即可" : "請長按複製下方連結，傳到手機開啟");
-  };
-  const lab = "text-sm text-stone-500 dark:text-stone-400";
-  return (
-    <div className={card}><h3 className="font-bold mb-2">☁️ 多裝置同步（Firebase 免費方案）</h3>
-      {cfg ? <>
-        <p className={lab}>{sync === "cloud" ? "已連線：電腦、手機各開一次頁面就會即時同步；兩台同時修改時，以最後修改的那台為準。" : sync === "err" ? "目前連不上雲端，恢復網路後會自動重試與合併。" : "連線中…"}</p>
-        <p className="text-xs text-stone-400 mt-1 break-all">資料庫：{cfg.url}</p>
-        <div className="flex gap-2 mt-3">
-          <button onClick={() => guard(mkLink)} className={btn + "flex-1 h-11 bg-sky-500 text-white"}>📱 產生手機設定連結</button>
-          <button onClick={() => guard(stop)} className={btn + "px-4 h-11 bg-stone-200 dark:bg-stone-700"}>停止同步</button></div>
-        {link && <textarea readOnly value={link} onFocus={e => e.target.select()} rows={3} className={inp + " h-auto py-2 text-xs font-mono mt-2"} />}
-      </> : <>
-        <p className={lab}>{sync === "local" ? "目前資料只存在這台裝置。設定一次雲端後，電腦與手機即可即時同步。" : "已透過其他方式連線。"}</p>
-        <details className="mt-2 text-sm"><summary className="cursor-pointer font-semibold text-orange-500">📖 第一次設定步驟（約 5 分鐘）</summary>
-          <ol className="list-decimal pl-5 mt-2 space-y-1 text-stone-600 dark:text-stone-300">
-            <li>到 <b>console.firebase.google.com</b>，用 Google 帳號「建立專案」（Analytics 可關閉）。</li>
-            <li>左側選 <b>建構 → Realtime Database → 建立資料庫</b>，位置選 Singapore，起始模式選「鎖定模式」。</li>
-            <li>進入「規則」分頁，把內容換成下方規則，按「發布」。</li>
-            <li>回到「資料」分頁，複製最上方網址（<code>https://…firebasedatabase.app</code>），貼到下面。</li>
-            <li>按 🎲 產生同步密碼 → 開始同步。再按「產生手機設定連結」傳到手機開啟。</li></ol>
-          <pre className="mt-2 p-2 rounded-xl bg-stone-100 dark:bg-stone-900 text-[11px] overflow-x-auto">{RULES}</pre>
-          <button onClick={async () => setM((await copy(RULES)) ? "規則已複製" : "請手動選取複製規則")} className="text-xs text-sky-600 mt-1">複製規則</button>
-        </details>
-        <input value={url} onChange={e => setUrl(e.target.value)} placeholder="資料庫網址 https://xxxx.firebasedatabase.app" className={inp + " mt-3 text-sm"} />
-        <div className="flex gap-2 mt-2">
-          <input value={code} onChange={e => setCode(e.target.value)} placeholder="同步密碼（12 碼以上英數字）" className={inp + " text-sm font-mono"} />
-          <button onClick={() => setCode(newCode())} aria-label="產生密碼" className={btn + "w-12 h-12 bg-stone-100 dark:bg-stone-700 text-xl"}>🎲</button></div>
-        <button disabled={busy || !url.trim() || !code.trim()} onClick={() => guard(start)} className={btn + "w-full h-11 mt-2 bg-orange-500 text-white disabled:opacity-40"}>{busy ? "測試連線中…" : "開始同步"}</button>
-        <p className="text-xs text-stone-400 mt-2">同步密碼就是資料在雲端的「門牌」，知道網址＋密碼的人才讀得到，請勿公開。</p>
-      </>}
-      {m && <p className="text-sm text-orange-500 mt-2">{m}</p>}
-    </div>);
-}
-function SettingsTab({ data, guard, commit, sync, cfg, setCfg, setUnlocked }) {
+function SettingsTab({ data, guard, commit, sync, setUnlocked }) {
   const [pin, setPin] = useState(""), [txt, setTxt] = useState(""), [msg, setMsg] = useState(""), [ok, setOk] = useState(false);
   const exportStr = () => JSON.stringify({ app: "stamp-card", ver: 2, at: new Date().toISOString(), data }, null, 2);
   const save = async () => {
-    try { const dl = window.claude && await window.claude.use("downloads");
-      if (dl) { await dl.save({ filename: "stamp-card-backup-" + new Date().toISOString().slice(0, 10) + ".json", data: exportStr() }); setMsg("已匯出"); }
-      else { setTxt(exportStr()); setMsg("請複製下方文字保存"); }
-    } catch (e) { setTxt(exportStr()); setMsg("無法直接下載，請複製下方文字"); }
+    try { const bl = new Blob([exportStr()], { type: "application/json" }); const el = document.createElement("a");
+      el.href = URL.createObjectURL(bl); el.download = "stamp-card-backup-" + new Date().toISOString().slice(0, 10) + ".json";
+      document.body.appendChild(el); el.click(); el.remove(); setMsg("已匯出"); }
+    catch (e) { setTxt(exportStr()); setMsg("無法直接下載，請複製下方文字"); }
   };
   const doImport = () => { try { const j = JSON.parse(txt); const d = j.data || j;
       if (!Array.isArray(d.kids)) throw 0;
@@ -448,7 +553,8 @@ function SettingsTab({ data, guard, commit, sync, cfg, setCfg, setUnlocked }) {
   const card = "rounded-3xl bg-white dark:bg-stone-800 shadow p-4 mb-4 ";
   return (
     <div>
-      <SyncCard card={card} sync={sync} cfg={cfg} setCfg={setCfg} guard={guard} />
+      <div className={card}><h3 className="font-bold mb-2">☁️ 多裝置同步</h3>
+        <p className="text-sm text-stone-500 dark:text-stone-400">{sync === "cloud" ? "已連線 Firebase，所有開啟這個網站（使用同一個 FAMILY_CODE）的裝置都會即時同步。" : sync === "ro" ? "目前帳號沒有寫入權限，僅能檢視。" : "尚未設定 Firebase（或連線失敗），資料只存在這台裝置，可用下方備份轉移。設定方式請看檔案最上方的說明。"}</p></div>
       <div className={card}><h3 className="font-bold mb-2">🔒 家長 PIN 碼</h3>
         <div className="flex gap-2"><input type="password" inputMode="numeric" maxLength={6} value={pin} onChange={e => setPin(e.target.value.replace(/\D/g, ""))} placeholder="4–6 位數字" className={inp} />
           <button disabled={pin.length < 4} onClick={() => guard(async () => { const h = await sha(pin); commit(s => ({ ...s, pin: h })); setPin(""); setUnlocked(false); setMsg("PIN 已設定，已鎖定"); })} className={btn + "px-4 h-12 bg-orange-500 text-white disabled:opacity-40"}>設定</button></div>
